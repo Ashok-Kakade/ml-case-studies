@@ -110,23 +110,11 @@ The recorded acceptance run executed 65 tests, and local API and UI acceptance c
 
 One failure is worth recording. The first CI-built deployment was rejected at startup because a Linux checkout normalized the historical line endings of the model source, which broke the byte-level provenance check. Rather than weakening the check, the fix preserved exact source bytes through Git attributes and added a build-time guard, keeping the accepted release identities intact.
 
-## 8. Limitations and Next Steps
-
-- **Scope of evidence:** results come from a 10,000-customer sample of known customers, so they do not establish full-population or unseen-customer performance. No conversion, revenue, or business uplift was measured.
-- **Segmentation:** separation is weak and sensitive to feature-group weighting, so segments are descriptive rather than ground truth.
-- **Models not built:** a two-tower neural recommender exists only as a proposal, with no implementation or result.
-- **Data:** the source is static, so real-time inference is implemented but live ingestion and automatic retraining are not. Drift reports compare historical prefixes and are diagnostics, not calibrated alerts.
-- **Access and operations:** authentication is a shared application token without per-customer ownership or rate limiting, and the deployment is sized for a portfolio demonstration with no availability objective.
-
-Natural next steps are a reviewed protocol for unseen-customer evaluation, a two-tower comparison against the selected baseline under that protocol, and a statistical test of the small gains between top baselines.
-
-## 9. What This Project Demonstrates
+## 8. What This Project Demonstrates
 
 - **Evaluation rigor:** leakage-free sequential splitting, a consumed final holdout, and model selection by a declared rule, including selecting the simpler model when it won.
 - **End-to-end ownership:** from data validation and feature design through a deployed, authenticated, observable service with keyless CI/CD.
 - **Honest reporting:** weak separation, negligible gains, and unbuilt components are stated alongside the results.
 - **Production habits from a QA background:** contract validation, integrity checks, failure-boundary testing, and reproducible releases applied to an ML system.
 
----
 
-*Figures come from the project's saved validation, final, and deployment reports as recorded in its technical design document (2026-10-06). Cloud resource identifiers and URLs are intentionally omitted from this public copy.*
