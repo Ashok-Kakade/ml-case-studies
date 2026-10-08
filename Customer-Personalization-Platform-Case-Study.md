@@ -4,35 +4,52 @@
 
 Prepared by Ashok
 
+> **Portfolio case study | October 2026.** Source code, evaluation artifacts, and a guided demo are available for discussion during interviews. The implementation repository is private and can be made temporarily public for an interview or demonstrated from my development environment.
+
 **Stack:** Python · scikit-learn · implicit ALS · FastAPI · Google Cloud Run · Streamlit · MLflow · Airflow · Evidently
 
 ---
 
 ## Executive Summary
 
-This project builds an end-to-end personalization platform on the public Instacart grocery dataset. It groups customers by shopping behavior, ranks products for each customer's next basket, and serves both through a token-protected API with a browser demo. It is a portfolio project built to production-style standards, and its most useful finding is not a model that won, but an evaluation that was honest enough to say which model should.
+I built a customer segmentation and next-basket recommendation platform using the public Instacart grocery dataset. The work covers data preparation, behavioral features, model comparison, API development, a browser demo, and cloud deployment. The main result was that a personal-purchase-frequency baseline outperformed the tested collaborative-filtering models, so I selected it for serving.
 
-Five baselines and ten tuned alternating-least-squares (ALS) collaborative-filtering trials were compared on a leakage-free validation split. A transparent baseline that ranks a customer's own most-purchased products, filled from their segment's popularity, scored Recall@10 of 0.333 and NDCG@10 of 0.395. The best ALS trial reached 0.191 and 0.208. The simpler method was selected and shipped; on a final holdout consumed exactly once it scored 0.323 and 0.391. The system is deployed with the API on Google Cloud Run and the interface on Streamlit Community Cloud.
+I compared five baselines and ten alternating-least-squares (ALS) collaborative-filtering configurations using a sequential validation split that keeps future baskets out of training. A transparent baseline that ranks a customer's own most-purchased products, filled from their segment's popularity, scored Recall@10 of 0.333 and NDCG@10 of 0.395. The best ALS trial reached 0.191 and 0.208. The simpler method was selected and shipped; on a final holdout consumed exactly once it scored 0.323 and 0.391. The portfolio deployment uses Google Cloud Run for the API and Streamlit Community Cloud for the private demo interface. It is an interview demonstration, not a commercial production service.
 
 ## 1. Background and Problem
 
 In grocery shopping, a large share of what a customer buys next is something they have bought before. That changes what a good recommender looks like: novelty is not the goal, and a sophisticated latent-factor model has to beat a simple count of what the customer already buys. The project asked two questions. Which approach ranks the products in a customer's next completed basket most accurately? And how can the winner be shipped as a service without leaking future information into evaluation or overstating what the evidence supports?
 
-The dataset also constrains the work. It has no prices, no calendar dates, and no demographics. Monetary RFM (recency, frequency, monetary value) and calendar recency are therefore impossible, and the project uses behavioral features instead and says so, rather than relabeling proxies as spend or churn.
+The dataset also constrains the work. It has no prices, no absolute calendar dates, and no demographics. Recorded inter-order gaps are capped at 30 days: a value of 30 means 30 or more, not an exact elapsed interval. Day-of-week codes have no verified mapping to weekday names. Monetary RFM (recency, frequency, monetary value) and calendar recency are therefore impossible, so I used behavioral features without interpreting them as spend or validated churn indicators.
 
-## 2. Design Philosophy
+## 2. Approach and Responsibilities
 
-- **Evidence over complexity.** Model choice follows a declared validation rule, not the appeal of a more advanced algorithm. ALS was built, tuned, and kept as a documented comparison, but it was not deployed because the evidence did not favor it.
-- **No leakage by construction.** Each customer's last two baskets are reserved: earlier baskets train the population models, the second-last selects among methods, and the last is a one-time final holdout. The split is sequential per customer rather than random, because a random row split would let a customer's future purchases into training while testing on their past.
-- **Claims bounded by evidence.** Weak cluster separation, a tiny gain over the nearest baseline, and the absence of any measured business uplift are all stated in the documentation rather than left for a reader to discover.
-- **Learning separated from serving.** At request time the API uses frozen population artifacts. A new basket can change that customer's features, segment, and ranking, but it never refits cluster centroids, popularity tables, or item factors.
-- **Reproducible, integrity-checked releases.** Segmentation and recommendation models ship as paired, checksummed bundles, and the runtime refuses to start on a mismatched or modified release.
+I explored features and models in notebooks, then moved stable logic into reusable Python classes. My responsibilities included designing the evaluation protocol, validating histories, comparing models, building the API and UI, packaging the application, and configuring deployment and operational checks.
+
+My Python and QA background shaped three decisions:
+
+- **Establish useful baselines first.** Compare ALS with purchase-frequency and popularity methods using the same candidates, histories, and metrics.
+- **Separate training from inference.** Fit population artifacts only on training histories. New demo baskets can change a customer's features and ranking without refitting the model.
+- **Treat validation as part of the product.** Reject invalid histories, preserve deterministic rankings, verify artifact integrity, and test persistence and failure behavior as well as successful requests.
 
 ## 3. Architecture
 
+```mermaid
+flowchart LR
+    Data[Historical Instacart data] --> Offline[Offline preparation and modeling]
+    Offline --> Artifacts[Frozen release archive in Cloud Storage]
+    Artifacts --> API[FastAPI on Cloud Run]
+    Browser[Browser] --> UI[Streamlit server on Community Cloud]
+    UI -->|Server-side API calls with token| API
+    API --> Store[Firestore synthetic demo histories]
+```
+
+The artifact download occurs during API startup. Each subsequent inference request
+uses loaded artifacts; the browser and Streamlit server do not train models.
+
 ### Data preparation
 
-Six raw Instacart tables are validated and reduced to a seeded sample of 10,000 customers with complete order histories. A sequence manifest assigns each order a role (train, validation, or final). For a customer with six baskets, baskets 1–4 train the population models, basket 5 selects the method, and basket 6 is reserved for final evaluation.
+Six raw Instacart tables are validated and reduced to a sample of 10,000 customers (seed 42) with complete observed histories, at least four orders, and a labeled last order in the source training set. Customers whose last source order is unlabeled are excluded. Complete observed history does not mean a customer's entire lifetime. A sequence manifest assigns each order a role (train, validation, or final). For a customer with six baskets, baskets 1–4 train the population models, basket 5 selects the method, and basket 6 is reserved for final evaluation. After model selection, baskets 1 through 5 become the observed input for predicting basket 6, while fitted population artifacts remain frozen. This is an existing-customer sequential evaluation, not an unseen-customer test or a global calendar-time backtest.
 
 ### Features and segmentation
 
@@ -47,18 +64,21 @@ Each customer is described by 32 raw features (30 used by the model): order coun
 
 *Names were assigned after inspecting cluster profiles, not before. Cluster IDs are arbitrary and carry no ranking.*
 
-Separation is weak: the K = 4 silhouette score is 0.090, below the 0.102 of K = 2. Results are highly stable across random seeds (pairwise agreement 0.976–0.998) but sensitive to how feature groups are weighted (0.35–0.52). The segments are therefore descriptive groupings of shopping tendencies, not ground-truth customer classes.
+Separation is weak: the K = 4 silhouette score is 0.090, below the 0.102 of K = 2. Results are highly stable across random seeds (pairwise Adjusted Rand Index, or ARI, 0.976–0.998) but sensitive to how feature groups are weighted (0.35–0.52). ARI measures agreement between cluster assignments after accounting for chance; it is not classification accuracy. The weight-sensitivity range refers to separately halving each feature group's squared-distance contribution. The segments are therefore descriptive groupings of shopping tendencies, not ground-truth customer classes.
 
 ### Recommendation
 
-Customer-product purchase counts form a sparse matrix of 10,000 by 34,636 products with 606,674 nonzero entries. Five baselines were evaluated: global popularity, segment popularity, most recent basket, personal frequency, and personal frequency with segment fill. Ten bounded ALS trials varied factors, regularization, iterations, and confidence scaling, with purchases treated as implicit feedback and repeat counts converted to a log-scaled confidence weight. Repeat purchases remain eligible, since repeating is the behavior being predicted.
+Customer-product purchase counts form a sparse matrix of 10,000 by 34,636 products with 606,674 nonzero entries. Five baselines were evaluated: global popularity, segment popularity, most recent basket, personal frequency, and personal frequency with segment fill. Ten bounded ALS trials varied factors, regularization, iterations, and confidence scaling, with purchases treated as implicit feedback and repeat counts converted to a log-scaled confidence weight. Repeat purchases remain eligible, since repeating is the behavior being predicted. ALS learns customer and product latent vectors; their dot products rank products and are not calibrated purchase probabilities. K-Means supplies customer clusters, not recommendation factors. Candidate products must have appeared in training; merely being in the 49,688-product catalog does not make a product recommendable.
 
 ### Serving and deployment
 
-- **API:** FastAPI with strict Pydantic contracts, Bearer-token authentication that fails closed when no token is configured, separate liveness and readiness checks, and a supplied-history route that scores any complete history without writing it.
-- **Cloud Run:** scale-to-zero container running as a non-root user with pinned dependencies. Model artifacts live in a private Cloud Storage archive pinned to an exact object generation and verified by SHA-256 at startup, and synthetic demo histories persist in Firestore, separate from benchmark data.
-- **CI/CD:** GitHub Actions builds and tests the images, and deployment uses Workload Identity Federation so no long-lived cloud key is stored.
-- **Interface:** a Streamlit app on Community Cloud that only calls the API, with no model loading or data access of its own.
+- **API:** FastAPI validates requests, provides separate liveness and readiness checks, and protects cloud requests with a shared Bearer token. It supports existing customers, saved synthetic demo histories, and supplied histories without persistence.
+- **Cold-start behavior:** an explicitly supplied empty history receives global-popularity recommendations. Customers with fewer than three orders can receive recommendations without a cluster assignment. Unknown stored IDs are rejected; catalog-unknown products are rejected, while catalog-known products outside the training candidates are ignored for ranking and reported.
+- **Cloud deployment:** a Docker container runs on Cloud Run with pinned dependencies. It downloads a versioned, checksum-verified model archive from private Cloud Storage at startup. Firestore stores synthetic demo histories separately from benchmark data.
+- **Delivery:** GitHub Actions builds images and runs focused tests. Manually triggered deployment uses Workload Identity Federation, which avoids storing a long-lived cloud credential in the workflow.
+- **Interface:** the browser connects to Streamlit; Streamlit's Python server calls the API. The UI does not load models or connect directly to the database.
+
+Requests use frozen models and explicit observed histories. The application does not ingest a live retailer feed or retrain during inference.
 
 ### MLOps tooling
 
@@ -66,7 +86,7 @@ MLflow records experiment runs and registers complete release bundles. Airflow o
 
 ## 4. Results
 
-Validation comparison across all 10,000 customers at K = 10, with equal weight per customer:
+Validation comparison across all 10,000 customers at K = 10, with equal weight per customer. Recall@10 is the fraction of target-basket products retrieved; NDCG@10 rewards placing relevant products earlier. Both include unsupported target products in their denominators. The validation set has 801 target entries outside the training candidate set. These offline metrics are not measured sales uplift:
 
 | Method | Recall@10 | NDCG@10 |
 |---|---:|---:|
@@ -77,9 +97,9 @@ Validation comparison across all 10,000 customers at K = 10, with equal weight p
 | Personal frequency + global fill | 0.3332 | 0.3953 |
 | **Personal frequency + segment fill (selected)** | **0.3334** | **0.3954** |
 
-The selected method's edge over plain personal frequency is 0.0002 in Recall@10, which is not a demonstrated gain. It was selected because it scored highest under the declared rule (validation NDCG@10), and its segment fill supplies items when a customer's personal list is short. The substantive result is the gap above ALS. A plausible reading is that in repeat-heavy grocery data a customer's own purchase counts are a stronger signal than shared latent structure, though the project did not run an experiment to confirm why.
+The selected method's absolute edge over personal frequency **with global fill** is 0.000164 in Recall@10 and 0.000066 in NDCG@10. These are observed differences, not demonstrated statistically significant or business gains. It was selected because it scored highest under the declared rule (validation NDCG@10), and its segment fill supplies items when a customer's personal list is short. Within these ten bounded ALS trials, the baseline has substantially higher validation metrics; this does not establish that all possible ALS configurations would underperform. A plausible reading is that in repeat-heavy grocery data a customer's own purchase counts are a stronger signal than shared latent structure, though the project did not run an experiment to confirm why.
 
-Final holdout, selected method only, scored once: Recall@10 0.323, NDCG@10 0.391, candidate coverage 0.352, with 12,187 unique products recommended and no short lists. The final targets were not reopened afterward, and further model selection would require a new reviewed evaluation protocol.
+Final holdout, selected method only, scored once: Recall@10 0.323, NDCG@10 0.391, candidate coverage 0.352, with 12,187 unique products recommended and no short lists. The saved final report records 885 unsupported target entries, retained in the metric denominators. Candidate coverage uses the 34,636 training products as its denominator, not the full catalog. The final holdout was reserved for the selected method and evaluated once. Further model selection requires a new evaluation protocol.
 
 ## 5. Key Engineering Decisions
 
@@ -104,17 +124,38 @@ Final holdout, selected method only, scored once: Recall@10 0.323, NDCG@10 0.391
 | MLOps | MLflow (tracking and registry), Apache Airflow, Evidently |
 | Delivery | Docker (non-root, pinned dependencies), GitHub Actions |
 
-## 7. Validation and Operational Evidence
+## 7. Engineering Validation and Lessons
 
-The recorded acceptance run executed 65 tests, and local API and UI acceptance checks passed. Deployed checks against the live API covered seven groups, including authentication rejection, repeatability of predictions, and two concurrent clients. Ten recommendation requests had a median client latency of 519 ms and a maximum of 809 ms. These are smoke measurements over a wide-area network, not a capacity claim. A hosted walkthrough of the published interface confirmed readiness, both model versions, an existing customer's ten recommendations and segment, and saved demo history.
+A recorded acceptance run on 2026-10-03 passed 65 tests, including local API/UI checks. Cloud smoke checks covered authentication rejection, deterministic recommendations, persistent synthetic baskets, duplicate-order rejection, and requests from two concurrent clients. Ten requests in that smoke sample had a median client latency of 519 ms and a maximum of 809 ms. These measurements include network time and are a small operational sample, not a load test or latency guarantee.
 
-One failure is worth recording. The first CI-built deployment was rejected at startup because a Linux checkout normalized the historical line endings of the model source, which broke the byte-level provenance check. Rather than weakening the check, the fix preserved exact source bytes through Git attributes and added a build-time guard, keeping the accepted release identities intact.
+One deployment issue reinforced the importance of reproducibility: Linux checkout normalized historical source-file line endings, causing the byte-level model provenance check to reject startup. I preserved the expected source bytes with Git attributes and added a build-time check. The lesson was to investigate compatibility failures rather than bypass the checks that detected them.
 
-## 8. What This Project Demonstrates
+The project also required a distinction between **model quality** and **software correctness**. Tests can establish that ranking, persistence, and API validation behave as intended. They cannot establish that customer segments are natural categories or that recommendations increase revenue; those require separate evidence.
 
-- **Evaluation rigor:** leakage-free sequential splitting, a consumed final holdout, and model selection by a declared rule, including selecting the simpler model when it won.
-- **End-to-end ownership:** from data validation and feature design through a deployed, authenticated, observable service with keyless CI/CD.
-- **Honest reporting:** weak separation, negligible gains, and unbuilt components are stated alongside the results.
-- **Production habits from a QA background:** contract validation, integrity checks, failure-boundary testing, and reproducible releases applied to an ML system.
+## 8. Limitations and Next Steps
 
+- **Offline evidence only.** Results measure the next basket of customers already represented in training. No online A/B test, business-uplift study, or unseen-customer quality evaluation is claimed.
+- **A small margin between the leading baselines.** Segment fill improves validation NDCG@10 by only 0.000066 over global fill. A paired customer bootstrap would help describe uncertainty, but would remain exploratory because validation selected the winner.
+- **Descriptive segmentation.** Low silhouette and feature-weight sensitivity limit how strongly the personas should be interpreted. They are not validated churn or marketing-response labels.
+- **Bounded operational scope.** The demo uses a shared access token; it does not implement per-customer authorization or application rate limiting. A small hosted walkthrough is not a comprehensive security or capacity assessment.
+- **Startup and UI latency.** Scale-to-zero hosting can add startup delay. Reducing repeated UI requests and measuring startup separately from warm requests are practical performance follow-ups.
+- **Manual model lifecycle.** MLflow, Airflow, and Evidently run on demand. Continuous ingestion, automated retraining, and a continuously hosted drift-alert service are outside the implemented scope.
+
+The next work is to strengthen uncertainty reporting and operational validation while preserving the existing evaluation boundary. Adding a more complex recommender would require a new, clearly scoped experiment rather than an assumption that complexity improves results.
+
+## 9. Demo Screenshots
+
+These historical local demo captures illustrate the interface. The visible `None` score values indicate that this serving policy does not expose a numeric score. They are not purchase probabilities.
+
+### Existing customer recommendations
+
+![Local demo showing customer 1, a behavioral segment, and ranked grocery recommendations](images/local-recommendations.png)
+
+*The interface brings a customer's segment and ranked products together. The displayed segment label is truncated in this capture; the full name is Morning beverage/snack shoppers.*
+
+### Returning demo customer
+
+![Local demo showing recommendations for a synthetic customer with insufficient segmentation history](images/local-demo-history.png)
+
+*Recommendations remain available for a synthetic customer with fewer than three completed baskets. The insufficient-history label applies to segmentation.*
 
